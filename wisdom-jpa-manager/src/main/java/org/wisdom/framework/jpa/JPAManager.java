@@ -19,9 +19,26 @@
  */
 package org.wisdom.framework.jpa;
 
-import com.google.common.base.Splitter;
+import java.io.IOException;
+import java.net.URL;
+import java.util.HashSet;
+import java.util.Set;
+
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBException;
+import javax.xml.bind.Unmarshaller;
+import javax.xml.bind.UnmarshallerHandler;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.parsers.SAXParser;
+import javax.xml.parsers.SAXParserFactory;
+
 import org.apache.felix.ipojo.Factory;
-import org.apache.felix.ipojo.annotations.*;
+import org.apache.felix.ipojo.annotations.Component;
+import org.apache.felix.ipojo.annotations.Context;
+import org.apache.felix.ipojo.annotations.Instantiate;
+import org.apache.felix.ipojo.annotations.Invalidate;
+import org.apache.felix.ipojo.annotations.Requires;
+import org.apache.felix.ipojo.annotations.Validate;
 import org.osgi.framework.Bundle;
 import org.osgi.framework.BundleContext;
 import org.osgi.framework.BundleEvent;
@@ -29,13 +46,14 @@ import org.osgi.util.tracker.BundleTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.wisdom.framework.jpa.model.Persistence;
+import org.xml.sax.Attributes;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+import org.xml.sax.XMLFilter;
+import org.xml.sax.XMLReader;
+import org.xml.sax.helpers.XMLFilterImpl;
 
-import javax.persistence.spi.PersistenceProvider;
-import javax.xml.bind.JAXB;
-import java.net.URL;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.regex.Pattern;
+import com.google.common.base.Splitter;
 
 /**
  * The entry point of the JPA bridge.
@@ -45,6 +63,32 @@ import java.util.regex.Pattern;
 @Component(immediate = true)
 @Instantiate
 public class JPAManager {
+
+    /**
+     * This XML Filter changes the namespace URI of the persistence.xml to the new version 2.1, regardless of the URI
+     * used. This is required because the wisdom-jps {@link Persistence} model is generated from the
+     * {@code persistence_2_1.xsd} definition, which will not unmarshal pre-2.1 persistence definitions correctly when
+     * the old namespace is used.
+     * 
+     * @author Thomas Wunschel <thomas.wunschel@binastar.de>
+     */
+    private static class NamespaceCompatibilityFilter extends XMLFilterImpl {
+
+        /** the namespace URL for persistence V2.1 */
+        private static final String NAMESPACE_2_1 = "http://xmlns.jcp.org/xml/ns/persistence";
+
+        @Override
+        public void endElement(final String uri, final String localName, final String qName) throws SAXException {
+            super.endElement(NAMESPACE_2_1, localName, qName);
+        }
+
+        @Override
+        public void startElement(final String uri, final String localName, final String qName, final Attributes atts)
+                throws SAXException {
+            super.startElement(NAMESPACE_2_1, localName, qName, atts);
+        }
+
+    }
 
     /**
      * The Meta-Persistence header.
@@ -78,10 +122,17 @@ public class JPAManager {
      * The tracked bundle.
      */
     BundleTracker<PersistentBundle> bundles;
+    
+    /**
+     * the JAXB context for unmarshalling the persistence.xml.
+     */
+    JAXBContext jcPersistence;
 
 
     @Validate
     void start() throws Exception {
+        jcPersistence = JAXBContext.newInstance(Persistence.class);
+        
         // Track bundles.
         bundles = new BundleTracker<PersistentBundle>(context, Bundle.ACTIVE + Bundle.STARTING, null) {
 
@@ -182,7 +233,8 @@ public class JPAManager {
                         " resource is found in the bundle at that location.", bundle, location);
             } else {
                 // Parse the XML file.
-                Persistence persistence = JAXB.unmarshal(url, Persistence.class);
+                Persistence persistence = unmarshalPersistence(url);
+				
                 LOGGER.info("Parsed persistence: {}, unit {}", persistence, persistence.getPersistenceUnit());
                 for (Persistence.PersistenceUnit pu : persistence.getPersistenceUnit()) {
                     if (pu.getProperties() == null) {
@@ -203,5 +255,37 @@ public class JPAManager {
         }
 
         return new PersistentBundle(bundle, set, factory);
+    }
+
+    /**
+     * Unmarshals the persistence.xml at the given URL. The {@link Persistence} model is generated from
+     * {@code persistence_2_1.xsd}, which by default only supports version 2.1. Support for version 1.0/2.0 has been
+     * added by using the {@link NamespaceFilter} for xml parsing.
+     * 
+     * @param url
+     *            the URL of the persistence.xml to unmarshal
+     * @return the unmarshalled persistence.xml
+     * @throws JAXBException
+     *             if the URL could not be unmarshalled
+     */
+    private Persistence unmarshalPersistence(final URL url) throws JAXBException {
+        try {
+            final SAXParserFactory spf = SAXParserFactory.newInstance();
+            final SAXParser sp = spf.newSAXParser();
+            final XMLReader xr = sp.getXMLReader();
+            final Unmarshaller unmarshaller = jcPersistence.createUnmarshaller();
+            final UnmarshallerHandler unmarshallerHandler = unmarshaller.getUnmarshallerHandler();
+            final InputSource xml = new InputSource(url.openStream());
+
+            final XMLFilter filter = new NamespaceCompatibilityFilter();
+            filter.setParent(xr);
+            filter.setContentHandler(unmarshallerHandler);
+            filter.parse(xml);
+
+            return (Persistence) unmarshallerHandler.getResult();
+        } catch (IllegalStateException | ParserConfigurationException | SAXException | IOException e) {
+            // technically not a JAXBException, but close enough
+            throw new JAXBException(e);
+        }
     }
 }
